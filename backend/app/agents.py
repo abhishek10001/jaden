@@ -8,6 +8,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from app.state import AgentState
 from app.github_ops import GitOpsReleaseManager
 from app.llm_manager import invoke_structured_with_fallback
+from app.approval_manager import approval_manager
 
 
 class ArchitectPlan(BaseModel):
@@ -168,7 +169,10 @@ def architect_node(state: AgentState) -> dict:
         Repository File Tree:
         {file_tree}
 
-        Select key files to read (always include src/app/page.tsx and package.json if present) and produce a clear architectural plan.""",
+        Select ONLY the minimal key file(s) that directly require changes for this task.
+        - For component or page modifications, select src/app/page.tsx or the relevant component file.
+        - Do NOT include package.json or layout.tsx unless the user explicitly requested package installation or site-wide layout changes.
+        Produce a concise architectural plan.""",
         schema=ArchitectPlan,
         state=state
     )
@@ -199,7 +203,15 @@ def architect_node(state: AgentState) -> dict:
 def coder_node(state: AgentState) -> dict:
     """Software Engineer — generates complete, build-ready source files based on the architect's plan."""
     rc = state.get("retry_count", 0)
-    coder_action = "Drafting Next.js components & Tailwind CSS..." if rc == 0 else f"Self-healing: fixing build errors (attempt {rc}/4)..."
+    has_human_feedback = "HUMAN REVIEWER FEEDBACK" in (state.get("error_logs") or "")
+
+    if has_human_feedback:
+        coder_action = f"Incorporating human reviewer changes & refining code (attempt {rc}/4)..."
+    elif rc > 0:
+        coder_action = f"Self-healing: fixing build errors (attempt {rc}/4)..."
+    else:
+        coder_action = "Drafting Next.js components & Tailwind CSS..."
+
     emit(state, "agent_activity", {
         "agent": "coder",
         "status": "active",
@@ -210,7 +222,10 @@ def coder_node(state: AgentState) -> dict:
 
     error_block = ""
     if state.get("error_logs"):
-        error_block = f"\nCRITICAL: PREVIOUS BUILD FAILED. FIX THESE EXACT COMPILER ERRORS:\n{state['error_logs']}\n"
+        if has_human_feedback:
+            error_block = f"\nHUMAN REVIEWER REQUESTED CHANGES. ADAPT THE CODE ACCORDING TO THIS FEEDBACK:\n{state['error_logs']}\n"
+        else:
+            error_block = f"\nCRITICAL: PREVIOUS BUILD FAILED. FIX THESE EXACT COMPILER ERRORS:\n{state['error_logs']}\n"
 
     result: CoderOutput = invoke_structured_with_fallback(
         role="coder",
@@ -223,18 +238,38 @@ def coder_node(state: AgentState) -> dict:
         MANDATORY PRODUCTION RULES:
         1. If any file uses useState, useEffect, useRef, onClick, onSubmit, or onChange, Line 1 MUST be 'use client';
         2. Use standard <img> tags or Tailwind gradients/SVGs instead of next/image <Image> for external URLs.
-        3. BRAND ICONS RULE: DO NOT import brand icons (Github, Linkedin, Twitter, X, Instagram, Discord) from 'lucide-react' — lucide-react does NOT export brand icons and will fail TypeScript verification! Always render brand icons as inline <svg> components or custom SVG elements. Only import generic UI icons from 'lucide-react' (e.g. Mail, ExternalLink, Code, Sparkles, ArrowRight, CheckCircle, Terminal, Cpu, Globe, Send, User, Briefcase, Award, Layers, Menu, X).
+        3. BRAND ICONS RULE: DO NOT import brand icons (Github, Linkedin, Twitter, X, Instagram, Discord) from 'lucide-react' — lucide-react does NOT export brand icons and will fail TypeScript verification! Always render brand icons as inline <svg> components or custom SVG elements. Only import generic UI icons from 'lucide-react'.
         4. ESLINT QUOTE ESCAPING: In JSX text, NEVER leave raw unescaped quotes (' or "). Always use &apos;, &quot;, or {{'\''}} (e.g. write "I&apos;m" instead of "I'm") to satisfy Next.js ESLint.
-        5. Output complete, valid file contents without truncation.""",
+        5. Output complete, valid file contents without truncation.
+        6. PRESERVE EXISTING CODE: For minor tasks or UI tweaks (e.g., removing a badge, changing a label or color), modify only the specific section requested. NEVER delete or break existing working functions, state, or components.
+        7. SCOPE HYGIENE: Do NOT modify or rewrite layout.tsx, package.json, or next.config.ts unless explicitly requested by the user. If only page.tsx requires changes, ONLY return src/app/page.tsx in the files array!
+        8. NEXT.JS 15/16 STATIC PRERENDER & HYDRATION RULE (CRITICAL):
+           Next.js 15+ / 16 (Turbopack) fails 'next build' during page prerendering if any dynamic/unstable value is evaluated at component top-level or inside initial useState!
+           - NEVER write `useState(() => new Date().getFullYear())` or `useState(new Date())` or `useState(Date.now())` or `Math.random()`.
+           - If you need the current year or a timestamp, initialize with a constant (e.g., `useState<number>(2025)` or `useState<string>('')`) and update it inside `useEffect(() => {{ setCurrentYear(new Date().getFullYear()); }}, [])`.
+        9. REACT STATE & LINT HYGIENE:
+           - NEVER call a `setState` function synchronously in the render body or unconditionally inside `useEffect` without a guard or dependency array.
+           - Always declare variables with `const` unless reassigned (`prefer-const`).""",
         schema=CoderOutput,
         state=state
     )
 
     edits = []
     updated_context = dict(state.get("relevant_files_content", {}))
+    user_prompt_lower = state.get("user_prompt", "").lower()
+    is_layout_requested = any(k in user_prompt_lower for k in ["layout", "root", "metadata", "title tag"])
+    is_package_requested = any(k in user_prompt_lower for k in ["package", "dependency", "install", "npm"])
+
     for f in result.files:
         clean_path = f.path.lstrip("./")
         line_count = len(f.content.splitlines())
+
+        # Guardrail against accidental destruction of root config files
+        if clean_path in ["src/app/layout.tsx", "layout.tsx"] and not is_layout_requested and line_count < 15:
+            continue
+        if clean_path == "package.json" and not is_package_requested:
+            continue
+
         emit(state, "agent_activity", {
             "agent": "coder",
             "status": "active",
@@ -275,18 +310,51 @@ def coder_node(state: AgentState) -> dict:
 def qa_tester_node(state: AgentState) -> dict:
     """QA & Tester Agent — executes intelligent multi-mode verification:
     Gate 1 & 2: Static build & SSR verification (npm run build)
+    Gate 1: Fast Static Gate (TypeScript type-check and ESLint diagnostics)
+    Gate 2: Next.js production build compilation (npm run build)
     Gate 3: Intelligent dynamic verification:
             - Frontend: Full-page Playwright browser test on target route
             - Backend: HTTP API endpoint functional probes & payload validation
             - Fullstack: Dual-gate verification (both API and UI)
     Gate 4: Multimodal visual inspection against user prompt (Frontend/Fullstack only)
     """
+    sandbox = state["sandbox"]
+
+    # ── Fast Static Gate: TypeScript & Linter Check (Latency Optimization) ──
     emit(state, "agent_activity", {
         "agent": "qa_tester",
         "status": "active",
-        "action": "Gate 1 & 2: Running 'npm run build' inside isolated Docker sandbox..."
+        "action": "Gate 1: Fast Static Gate // Running TypeScript (tsc --noEmit) & ESLint diagnostics..."
     })
-    sandbox = state["sandbox"]
+    static_passed, static_logs, static_details = sandbox.run_fast_static_gate()
+
+    if not static_passed:
+        emit(state, "qa_result", {
+            "passed": False,
+            "static_passed": False,
+            "build_passed": False,
+            "browser_passed": False,
+            "visual_passed": False,
+            "logs": static_logs,
+            "exit_code": 1,
+            "retry_count": state.get("retry_count", 0) + 1
+        })
+        emit(state, "agent_activity", {
+            "agent": "qa_tester",
+            "status": "error",
+            "action": "Fast Static Gate failed (TypeScript/Linter errors). Short-circuiting directly to Coder..."
+        })
+        return {
+            "qa_passed": False,
+            "error_logs": f"FAST STATIC GATE FAILED:\n{static_logs[-3000:]}",
+            "retry_count": state.get("retry_count", 0) + 1
+        }
+
+    emit(state, "agent_activity", {
+        "agent": "qa_tester",
+        "status": "active",
+        "action": "Gate 1 Passed (TypeScript 0 errors). Gate 2: Compiling production build..."
+    })
     exit_code, build_logs = sandbox.run_cmd("npm run build")
     build_passed = (exit_code == 0)
 
@@ -473,8 +541,8 @@ def qa_tester_node(state: AgentState) -> dict:
     }
 
 
-def release_node(state: AgentState) -> dict:
-    """GitOps Release Agent — commits, pushes, opens PR, merges, and deploys to Vercel."""
+def preview_release_node(state: AgentState) -> dict:
+    """GitOps Preview Agent — commits, pushes branch, opens Draft PR, and provisions Preview environment."""
     emit(state, "agent_activity", {
         "agent": "release",
         "status": "active",
@@ -495,36 +563,160 @@ def release_node(state: AgentState) -> dict:
     emit(state, "agent_activity", {
         "agent": "release",
         "status": "active",
-        "action": "Opening GitHub Pull Request..."
+        "action": "Opening GitHub Pull Request for human review..."
     })
     pr_num, pr_url = gitops.create_pull_request(
         branch_name=state["branch_name"],
-        title=f"[Autonomous Agent] {state['user_prompt'][:60]}",
-        body=f"### Architectural Specification\n{state['plan_spec']}\n\n✅ Verified inside isolated Docker sandbox (`npm run build` exit code 0)."
+        title=f"[Autonomous SDLC] {state['user_prompt'][:60]}",
+        body=(
+            f"### Architectural Specification\n{state['plan_spec']}\n\n"
+            f"✅ Built & verified inside isolated Docker sandbox (`npm run build` exit code 0).\n\n"
+            f"⏳ **Status:** Ephemeral Preview built. Pending Human Approval before Production Merge."
+        )
     )
 
     emit(state, "agent_activity", {
         "agent": "release",
         "status": "active",
-        "action": f"PR #{pr_num} created! Squash-merging into main branch..."
+        "action": "Provisioning preview environment and registering Pull Request..."
     })
-    merged, _ = gitops.wait_and_merge_pr(pr_num)
+    preview_url = ""
+    try:
+        preview_url = gitops.deploy_preview(sandbox, os.getenv("VERCEL_TOKEN", ""))
+    except Exception as e:
+        print(f"[Preview deploy warning] {e}")
+
+    display_preview = preview_url if (preview_url and preview_url.startswith("http")) else pr_url
+
+    emit(state, "preview_ready", {
+        "pr_number": pr_num,
+        "pr_url": pr_url,
+        "preview_url": display_preview,
+        "branch_name": state["branch_name"],
+        "prNumber": pr_num,
+        "prUrl": pr_url,
+        "previewUrl": display_preview,
+        "branchName": state["branch_name"]
+    })
+
+    return {
+        "pr_number": pr_num,
+        "pr_url": pr_url,
+        "preview_url": display_preview,
+        "approval_status": "pending"
+    }
+
+
+def human_approval_node(state: AgentState) -> dict:
+    """Human-in-the-Loop Approval Gate — suspends automated deployment until explicit human review."""
+    run_id = state.get("run_id") or "default_run"
+    files_changed = [f["path"] for f in state.get("files_to_edit", [])]
+    visual_score = (state.get("visual_validation") or {}).get("visual_score")
+
+    payload = {
+        "run_id": run_id,
+        "runId": run_id,
+        "pr_number": state.get("pr_number"),
+        "pr_url": state.get("pr_url"),
+        "preview_url": state.get("preview_url"),
+        "branch_name": state.get("branch_name"),
+        "visual_score": visual_score,
+        "target_route": state.get("target_route") or "/",
+        "files_changed": files_changed,
+        "qa_type": state.get("qa_type") or "frontend",
+        "screenshot": state.get("screenshot_base64") or ""
+    }
+
+    emit(state, "approval_required", payload)
+    emit(state, "agent_activity", {
+        "agent": "gate",
+        "status": "active",
+        "action": "Awaiting Human Review // Inspect In-App Preview & sign-off to merge into production."
+    })
+
+    def on_tick(elapsed: float):
+        # Keep SSE connection alive with periodic heartbeats while waiting for human decision
+        emit(state, "heartbeat", {
+            "run_id": run_id,
+            "status": "awaiting_human_approval",
+            "elapsed_sec": int(elapsed)
+        })
+
+    # Wait up to 15 minutes for user decision
+    decision = approval_manager.wait_for_decision(run_id, timeout_sec=900, on_tick=on_tick)
+
+    if not decision:
+        emit(state, "agent_activity", {
+            "agent": "release",
+            "status": "error",
+            "action": "Human review timed out after 15 minutes. Execution halted."
+        })
+        return {
+            "approval_status": "timed_out",
+            "error_logs": "Deployment aborted: Human approval gate timed out."
+        }
+
+    if decision.get("approved"):
+        emit(state, "agent_activity", {
+            "agent": "release",
+            "status": "active",
+            "action": "Human Approval Received! Proceeding with Squash Merge and Production Release..."
+        })
+        return {
+            "approval_status": "approved",
+            "human_feedback": None
+        }
+    else:
+        feedback = decision.get("feedback") or "Human reviewer requested changes."
+        approval_manager.reset_for_retry(run_id)
+        emit(state, "agent_activity", {
+            "agent": "release",
+            "status": "active",
+            "action": f"Reviewer requested modifications: '{feedback}'. Re-routing to Coder agent..."
+        })
+        return {
+            "approval_status": "rejected",
+            "qa_passed": False,
+            "human_feedback": feedback,
+            "error_logs": f"HUMAN REVIEWER FEEDBACK:\n{feedback}",
+            "retry_count": state.get("retry_count", 0) + 1
+        }
+
+
+def production_release_node(state: AgentState) -> dict:
+    """Promotes approved build to production: squash-merges PR and deploys to Vercel production CDN."""
+    emit(state, "agent_activity", {
+        "agent": "release",
+        "status": "active",
+        "action": f"Squash-merging PR #{state.get('pr_number')} into main branch..."
+    })
+
+    gitops = GitOpsReleaseManager(
+        token=os.getenv("GITHUB_TOKEN"),
+        repo_full_name=state["repo_full_name"],
+        base_branch=os.getenv("PRODUCTION_BRANCH", "main"),
+        create_if_missing=False
+    )
+
+    merged, _ = gitops.wait_and_merge_pr(state["pr_number"])
 
     emit(state, "agent_activity", {
         "agent": "release",
         "status": "active",
-        "action": "Deploying verified build to Vercel CDN..."
+        "action": "Deploying verified build to Vercel Production CDN..."
     })
-    live_url = gitops.deploy_to_vercel(sandbox, os.getenv("VERCEL_TOKEN", ""))
+    live_url = gitops.deploy_to_vercel(state["sandbox"], os.getenv("VERCEL_TOKEN", ""))
 
     emit(state, "release_complete", {
-        "pr_number": pr_num,
-        "pr_url": pr_url,
+        "pr_number": state.get("pr_number"),
+        "pr_url": state.get("pr_url"),
+        "preview_url": state.get("preview_url"),
         "production_merged": merged,
         "live_url": live_url,
         "branch_name": state["branch_name"],
-        "prNumber": pr_num,
-        "prUrl": pr_url,
+        "prNumber": state.get("pr_number"),
+        "prUrl": state.get("pr_url"),
+        "previewUrl": state.get("preview_url"),
         "productionMerged": merged,
         "liveUrl": live_url,
         "branchName": state["branch_name"]
@@ -532,12 +724,15 @@ def release_node(state: AgentState) -> dict:
     emit(state, "agent_activity", {
         "agent": "release",
         "status": "done",
-        "action": f"Release successful! Production URL: {live_url}"
+        "action": f"Production release successful! Live URL: {live_url}"
     })
 
     return {
-        "pr_number": pr_num,
-        "pr_url": pr_url,
         "production_merged": merged,
-        "live_url": live_url
+        "live_url": live_url,
+        "approval_status": "approved"
     }
+
+
+# Backwards compatibility alias
+release_node = production_release_node

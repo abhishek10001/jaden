@@ -96,7 +96,7 @@ Jaden executes agent code in an isolated Docker container with pre-installed Pla
 
 ```bash
 cd sandbox
-docker build -t agent-sandbox:latest .
+docker build -t agent-sandbox:latest d.
 ```
 
 ---

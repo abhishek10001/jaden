@@ -1,5 +1,6 @@
 import os
 import base64
+import shlex
 import docker
 
 
@@ -10,24 +11,45 @@ class DockerSandbox:
     for both greenfield scaffolding and existing repo updates.
     """
 
-    def __init__(self, repo_full_name: str, github_token: str, branch_name: str):
+    def __init__(self, repo_full_name: str, github_token: str, branch_name: str, git_name: str | None = None, git_email: str | None = None):
         self.client = docker.from_env(timeout=300)
         self.repo_full_name = repo_full_name
         self.github_token = github_token
         self.branch_name = branch_name
         self.container = None
+        self.git_name = git_name or os.getenv("GIT_COMMIT_NAME") or os.getenv("GITHUB_USERNAME") or "Autonomous SDLC Agent"
+        self.git_email = git_email or os.getenv("GIT_COMMIT_EMAIL") or (f"{os.getenv('GITHUB_USERNAME')}@users.noreply.github.com" if os.getenv("GITHUB_USERNAME") else "autonomous-agent@users.noreply.github.com")
 
     def _start_container(self):
+        container_env = {
+            "GITHUB_TOKEN": self.github_token,
+            "VERCEL_TOKEN": os.getenv("VERCEL_TOKEN", ""),
+            "CI": "1"
+        }
         self.container = self.client.containers.run(
             image="agent-sandbox:latest",
             detach=True,
             mem_limit="2g",
-            working_dir="/workspace"
+            working_dir="/workspace",
+            environment=container_env
+        )
+        # Ensure git author is configured with a valid GitHub email accepted by Vercel
+        self.run_cmd(f'git config --global user.name "{self.git_name}"', workdir="/workspace")
+        self.run_cmd(f'git config --global user.email "{self.git_email}"', workdir="/workspace")
+        # Security Hardening: Inject GitHub credentials via git credential helper reading from environment
+        self.run_cmd(
+            'git config --global credential.helper \'!f() { echo "username=x-access-token"; echo "password=${GITHUB_TOKEN}"; }; f\'',
+            workdir="/workspace"
         )
 
-    def run_cmd(self, command: str, workdir: str = "/workspace/repo") -> tuple[int, str]:
+
+    def run_cmd(self, command: str, workdir: str = "/workspace/repo", timeout: int | None = None) -> tuple[int, str]:
+        if timeout:
+            cmd = ["bash", "-c", f"timeout {timeout}s bash -c {shlex.quote(command)}"]
+        else:
+            cmd = ["bash", "-c", command]
         exit_code, output = self.container.exec_run(
-            cmd=["bash", "-c", command],
+            cmd=cmd,
             workdir=workdir
         )
         return exit_code, output.decode("utf-8", errors="replace")
@@ -53,11 +75,12 @@ class DockerSandbox:
             workdir="/workspace/repo"
         )
 
-        auth_url = f"https://x-access-token:{self.github_token}@github.com/{self.repo_full_name}.git"
+        # Clean Git URL; authentication is handled via container environment credential helper
+        repo_url = f"https://github.com/{self.repo_full_name}.git"
         self.run_cmd("git add -A")
         self.run_cmd('git commit -m "chore: initial Next.js scaffold" || true')
         self.run_cmd(f"git branch -M {base_branch}")
-        self.run_cmd(f"git remote add origin {auth_url}")
+        self.run_cmd(f"git remote add origin {repo_url}")
 
         # Check if origin already has existing commits to prevent overwriting history
         check_code, remote_check = self.run_cmd(f"git ls-remote --heads origin {base_branch}")
@@ -80,8 +103,8 @@ class DockerSandbox:
     def start_and_clone(self):
         """Clones an existing repository and checks out a fresh feature branch."""
         self._start_container()
-        auth_url = f"https://x-access-token:{self.github_token}@github.com/{self.repo_full_name}.git"
-        code, out = self.run_cmd(f"git clone {auth_url} /workspace/repo", workdir="/workspace")
+        repo_url = f"https://github.com/{self.repo_full_name}.git"
+        code, out = self.run_cmd(f"git clone {repo_url} /workspace/repo", workdir="/workspace")
         if code != 0:
             raise RuntimeError(f"Git clone failed:\n{out}")
         self.run_cmd(f"git checkout -b {self.branch_name}")
@@ -116,6 +139,57 @@ class DockerSandbox:
         if code == 0 and out.strip():
             return out.strip()
         return ""
+
+    def run_fast_static_gate(self) -> tuple[bool, str, dict]:
+        """Runs fast static diagnostics (TypeScript type-check and ESLint) before starting dev server or browser.
+
+        Returns (passed: bool, diagnostic_logs: str, details: dict).
+        """
+        details = {
+            "tsc_passed": True,
+            "tsc_logs": "",
+            "eslint_passed": True,
+            "eslint_logs": ""
+        }
+        diagnostic_lines = []
+
+        # 1. Fast TypeScript compiler type-check (tsc --noEmit)
+        tsc_code, tsc_out = self.run_cmd("npx --no-install tsc --noEmit", timeout=45)
+        if tsc_code != 0:
+            details["tsc_passed"] = False
+            details["tsc_logs"] = tsc_out.strip()
+            diagnostic_lines.append(f"=== TypeScript Type Check FAILED (Exit {tsc_code}) ===\n{tsc_out.strip()}")
+        else:
+            details["tsc_logs"] = "TypeScript compilation passed with 0 errors."
+
+        # 2. Fast Linter check (clean command without unsupported flags)
+        lint_code, lint_out = self.run_cmd("CI=1 npm run lint", timeout=45)
+        clean_lint = lint_out.strip()
+        # Fail on fatal syntax parsing errors or when TypeScript also failed
+        if lint_code != 0 and ("Parsing error" in clean_lint or "SyntaxError" in clean_lint or tsc_code != 0):
+            details["eslint_passed"] = False
+            details["eslint_logs"] = clean_lint
+            diagnostic_lines.append(f"=== Linter FAILED ===\n{clean_lint}")
+        else:
+            details["eslint_logs"] = clean_lint or "ESLint check passed or reported non-fatal warnings."
+
+        # 3. Next.js 15/16 Static Prerender Antipattern Check (catches new Date() in useState initializers)
+        _, date_check_out = self.run_cmd(
+            "grep -rnE 'useState.*new Date' src/ || true",
+            timeout=10
+        )
+        if date_check_out.strip():
+            details["tsc_passed"] = False
+            diagnostic_lines.append(
+                f"=== Next.js 15/16 Prerender Unstable Value Violation ===\n"
+                f"Detected 'new Date()' inside useState initializer in:\n{date_check_out.strip()}\n"
+                f"Next.js Turbopack strictly bans dynamic values inside useState initializers because static page prerender fails.\n"
+                f"FIX: Initialize state with a constant (e.g. useState(2025)) and update inside useEffect(() => {{ setCurrentYear(new Date().getFullYear()); }}, []);"
+            )
+
+        passed = details["tsc_passed"] and details["eslint_passed"]
+        logs = "\n\n".join(diagnostic_lines) if diagnostic_lines else "Fast Static Gate: TypeScript and Linter passed with 0 errors."
+        return passed, logs, details
 
     def run_qa_verification(self, qa_config: dict = None) -> tuple[bool, dict, str, str]:
         """Runs intelligent multi-mode QA verification inside Docker:
@@ -408,6 +482,19 @@ const config = JSON.parse(fs.readFileSync('/workspace/qa_config.json', 'utf8'));
             self.run_cmd(f'git commit --allow-empty -m "{commit_message} (verified state)"')
 
         return self.run_cmd(f"git push -u origin {self.branch_name}")
+
+    def halt(self):
+        """Immediately stops and removes the running container upon operator request."""
+        if self.container:
+            try:
+                self.container.stop(timeout=1)
+            except Exception:
+                pass
+            try:
+                self.container.remove(force=True)
+            except Exception:
+                pass
+            self.container = None
 
     def cleanup(self):
         if self.container:

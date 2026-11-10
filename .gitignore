@@ -60,6 +60,7 @@ playwright/.cache/
 /workspace/
 /tmp/
 *.log
+.run_cache/
 
 # IDE & OS files
 .vscode/

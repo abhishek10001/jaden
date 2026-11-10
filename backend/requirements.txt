@@ -8,3 +8,6 @@ docker==7.1.0
 PyGithub==2.5.0
 python-dotenv==1.0.1
 pydantic==2.10.2
+pymongo>=4.9.0
+motor>=3.6.0
+

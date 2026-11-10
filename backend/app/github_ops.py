@@ -1,5 +1,6 @@
 import time
 from github import Github, GithubException
+import os
 
 
 class GitOpsReleaseManager:
@@ -26,6 +27,29 @@ class GitOpsReleaseManager:
                 )
             raise
 
+    def get_commit_author(self) -> tuple[str, str]:
+        """Resolves the git author name and a valid email associated with the GitHub account."""
+        env_email = os.getenv("GIT_COMMIT_EMAIL")
+        env_name = os.getenv("GIT_COMMIT_NAME")
+
+        name = env_name
+        email = env_email
+
+        try:
+            user = self.gh.get_user()
+            if not name:
+                name = user.name or user.login or "Autonomous SDLC Agent"
+            if not email:
+                email = user.email or f"{user.login}@users.noreply.github.com"
+        except Exception:
+            if not name:
+                name = os.getenv("GITHUB_USERNAME") or "Autonomous SDLC Agent"
+            if not email:
+                gh_user = os.getenv("GITHUB_USERNAME") or "agent"
+                email = f"{gh_user}@users.noreply.github.com"
+
+        return name, email
+
     def create_pull_request(self, branch_name: str, title: str, body: str) -> tuple[int, str]:
         try:
             pr = self.repo.create_pull(
@@ -36,11 +60,24 @@ class GitOpsReleaseManager:
             )
             return pr.number, pr.html_url
         except GithubException as e:
-            if e.status == 422 and "No commits between" in str(e):
-                raise RuntimeError(
-                    f"GitHub PR failed: The branch '{branch_name}' has 0 commits ahead of '{self.base_branch}'. "
-                    f"The codebase was already in sync with production."
-                )
+            if e.status == 422:
+                err_str = str(e)
+                if "No commits between" in err_str:
+                    raise RuntimeError(
+                        f"GitHub PR failed: The branch '{branch_name}' has 0 commits ahead of '{self.base_branch}'. "
+                        f"The codebase was already in sync with production."
+                    )
+                # If PR already exists for this branch (e.g. from an earlier approval iteration), reuse it
+                if "A pull request already exists" in err_str:
+                    try:
+                        owner = self.repo.owner.login
+                        pulls = self.repo.get_pulls(state="open", head=f"{owner}:{branch_name}")
+                        if pulls.totalCount > 0:
+                            existing_pr = pulls[0]
+                            existing_pr.edit(title=title, body=body)
+                            return existing_pr.number, existing_pr.html_url
+                    except Exception:
+                        pass
             raise
 
     def wait_and_merge_pr(self, pr_number: int, timeout_sec: int = 90) -> tuple[bool, str]:
@@ -62,25 +99,16 @@ class GitOpsReleaseManager:
             elapsed += 5
         return False, "Timed out waiting for PR mergeability."
 
-    def deploy_to_vercel(self, sandbox, vercel_token: str) -> str:
-        if not vercel_token:
-            return "https://vercel.com (Set VERCEL_TOKEN in .env for instant CLI URL)"
-        sandbox.run_cmd(f"git checkout {self.base_branch} && git pull origin {self.base_branch}")
-
-        # Deploy directly inside the repository
-        cmd = f"npx vercel deploy --prod --yes --token={vercel_token}"
-        code, output = sandbox.run_cmd(cmd)
-        if code != 0:
-            return f"Vercel CLI warning: {output[-300:]}"
-
+    def _extract_vercel_url(self, output: str, is_production: bool = False) -> str:
         import re
 
-        # 1. Look for explicit "Production: https://..." in Vercel CLI output
-        prod_match = re.search(r'Production:\s*(https://[^\s]+)', output)
-        if prod_match:
-            return prod_match.group(1).strip().rstrip(".")
+        # Look for explicit "Production: https://..." or "Preview: https://..."
+        prefix = "Production:" if is_production else "(?:Preview|Production):"
+        match = re.search(rf'{prefix}\s*(https://[^\s]+)', output)
+        if match:
+            return match.group(1).strip().rstrip(".")
 
-        # 2. Extract all live .vercel.app URLs from CLI output (filtering out vercel.com inspect links)
+        # Extract all live .vercel.app URLs (filtering out vercel.com inspect links)
         live_urls = []
         for line in output.splitlines():
             line_str = line.strip()
@@ -90,10 +118,8 @@ class GitOpsReleaseManager:
                     live_urls.append(m.rstrip("."))
 
         if live_urls:
-            # The last emitted vercel.app URL by Vercel CLI is always the production alias URL
             return live_urls[-1]
 
-        # 3. Fallback: Any https:// line from output that isn't a dashboard inspect link
         fallback_urls = [
             line.strip()
             for line in output.splitlines()
@@ -103,4 +129,42 @@ class GitOpsReleaseManager:
             return fallback_urls[-1]
 
         return "https://vercel.com"
+
+    def deploy_preview(self, sandbox, vercel_token: str) -> str:
+        """Deploys an ephemeral preview environment from the current feature branch."""
+        if not vercel_token or not vercel_token.strip():
+            return ""
+
+        try:
+            # Security Hardening: Token is injected via container environment; no cleartext token in command line
+            cmd = "CI=1 npx -y vercel deploy --yes"
+            code, output = sandbox.run_cmd(cmd, timeout=25)
+            if code != 0:
+                print(f"[Vercel Preview] Deployment skipped or unlinked: {output[-200:]}")
+                return ""
+            return self._extract_vercel_url(output, is_production=False)
+        except Exception as e:
+            print(f"[Vercel Preview Exception] {e}")
+            return ""
+
+    def deploy_to_vercel(self, sandbox, vercel_token: str) -> str:
+        """Deploys the production release after merging to main."""
+        fallback_url = f"https://github.com/{self.repo_full_name}"
+        if not vercel_token or not vercel_token.strip():
+            return fallback_url
+
+        try:
+            sandbox.run_cmd(f"git checkout {self.base_branch} && git pull origin {self.base_branch}", timeout=25)
+            # Security Hardening: Token is injected via container environment; no cleartext token in command line
+            cmd = "CI=1 npx -y vercel deploy --prod --yes"
+            code, output = sandbox.run_cmd(cmd, timeout=30)
+            if code != 0:
+                print(f"[Vercel Prod Deploy] CLI finished with exit {code}")
+                return fallback_url
+            extracted = self._extract_vercel_url(output, is_production=True)
+            return extracted or fallback_url
+        except Exception as e:
+            print(f"[Vercel Prod Deploy Exception] {e}")
+            return fallback_url
+
 

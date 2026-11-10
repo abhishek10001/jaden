@@ -21,6 +21,10 @@ class AgentState(TypedDict):
     retry_count: int
     pr_number: Optional[int]
     pr_url: Optional[str]
+    run_id: Optional[str]
+    preview_url: Optional[str]                 # Ephemeral preview deployment URL (e.g. Vercel Preview)
+    approval_status: Optional[str]             # "pending", "approved", "rejected", "timed_out"
+    human_feedback: Optional[str]              # Reviewer comments/changes requested
     production_merged: bool
     live_url: Optional[str]
     emit_event: Optional[Any]
