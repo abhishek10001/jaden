@@ -1,10 +1,10 @@
-# ⚡ Jaden — Autonomous Multi-Agent SDLC Platform
+#  Jaden — Autonomous Multi-Agent SDLC Platform
 
 **Jaden** is an end-to-end autonomous software development lifecycle (SDLC) platform powered by **LangGraph**, **FastAPI**, **Docker**, and **Next.js**. Given a natural language prompt, Jaden coordinates a team of specialized AI agents to plan, scaffold, code, test, visually validate in a headless browser, self-heal, and automatically ship production-ready pull requests to GitHub.
 
 ---
 
-## 🚀 Key Features
+##  Key Features
 
 - **Multi-Agent State Machine**: Deterministic orchestration via **LangGraph** with explicit typed state management (`AgentState`).
 - **Self-Healing Code Loop**: The QA agent executes builds, lints, and test suites. On failure, error telemetry routes back to the Coder agent for iterative repair (up to 4 automated retry cycles).
@@ -16,7 +16,7 @@
 
 ---
 
-## 🏗️ Architecture
+##  Architecture
 
 ```
                        +-----------------------+
@@ -46,7 +46,7 @@
 
 ---
 
-## 📁 Repository Structure
+##  Repository Structure
 
 ```text
 Jaden/
@@ -68,7 +68,7 @@ Jaden/
 
 ---
 
-## 🛠️ Tech Stack
+##  Tech Stack
 
 - **Orchestration**: [LangGraph](https://github.com/langchain-ai/langgraph)
 - **Backend API**: [FastAPI](https://fastapi.tiangolo.com/), [Pydantic](https://docs.pydantic.dev/), SSE-Starlette
@@ -79,7 +79,7 @@ Jaden/
 
 ---
 
-## ⚙️ Getting Started
+##  Getting Started
 
 ### Prerequisites
 
@@ -156,7 +156,7 @@ Open [http://localhost:3000](http://localhost:3000) in your browser.
 
 ---
 
-## 🚦 How It Works
+##  How It Works
 
 1. **Prompt Entry**: Input a repository name and prompt (e.g., *"Build a modern SaaS pricing page with monthly/yearly toggles"*).
 2. **Docker Provisioning**: Jaden spawns an isolated container and clones the repository or scaffolds a greenfield project.
